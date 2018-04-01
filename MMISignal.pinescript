@@ -1,0 +1,166 @@
+//@version=3
+study("MMI Signal", overlay=true, precision=8)
+
+//
+// Revision:        1
+// Author:          @sherwind
+// URL:             https://github.com/sherwind/pinescript-mmi_signal
+//
+// Trend trading strategies filtered by the Market Meanness Index.
+// 
+// This is a port of the experiment described at
+// 
+//   http://www.financial-hacker.com/boosting-systems-by-trade-filtering/
+//   http://www.financial-hacker.com/trend-delusion-or-reality/
+//   http://www.financial-hacker.com/trend-and-exploiting-it/
+//   http://www.financial-hacker.com/whites-reality-check/
+//
+// The Market Meanness Index tells whether the market is currently moving in or out of a "trending" regime. 
+// It can this way prevent losses by false signals of trend indicators. It is a purely statistical algorithm
+// and not based on volatility, trends, or cycles of the price curve.
+//
+// The indicator measures the meanness of the market - its tendency to revert to the mean after pretending
+// to start a trend. If that happens too often, all trend following systems will bite the dust.
+//
+// Inputs:
+//
+//   Price Source: Either open, high, low, close, hl2, hlc3, or ohlc4. The default value is hlc3.
+//   Trend MA Type: Either SMA, EMA, LowPass, Hull MA, Zero-Lag MA, ALMA, Laguerre, Smooth, Decycle. The default value is LowPass.
+//   Trend MA Period: Sets the lookback period of trend MA. The default value is 200.
+//   MMI Period: Sets the lookback period of the Market Meanness Index. The default value is 300.
+//
+//
+// -----------------------------------------------------------------------------
+// Copyright 2018 sherwind
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+// 
+// The GNU General Public License can be found here
+// <http://www.gnu.org/licenses/>.
+//
+// -----------------------------------------------------------------------------
+//
+
+price_src         = input(title="Price Source", type=source, defval=hlc3)
+trend_filter_type = input(defval="LowPass", title="Trend MA Type: ", options=["SMA", "EMA", "LowPass", "Hull MA", "Zero-Lag MA", "ALMA", "Laguerre", "Smooth", "Decycle"], type=string)
+trend_filter_len  = input(defval=200, title="Trend MA Period", minval=10)
+mmi_len           = input(defval=300, title="MMI Period", minval=200, maxval=500) // See http://www.opserver.de/ubb7/ubbthreads.php?ubb=showflat&Number=453245#Post453245
+
+
+is_peak(src)    => rising(src[1], 1) and falling(src, 1)
+is_valley(src)  => falling(src[1], 1) and rising(src, 1)
+is_rising(src)  => rising(src, 1)
+is_falling(src) => falling(src, 1)
+
+median(src, len) => percentile_nearest_rank(src, len, 50)
+
+// Market Meanness Index by Johann C. Lotter
+mmi(src, len) => 
+    len_ = min(len, 1000)
+    mmi_ = 0.0
+    if (len_ < 2) 
+        mmi_ := 75
+    else
+        nh = 0
+        nl = 0
+        median_ = median(src, len_)
+        for i = 1 to len_ - 1
+            if (src[i] > median_ and src[i] > src[i - 1])
+                nl := nl + 1
+            else
+                if (src[i] < median_ and src[i] < src[i - 1])
+                    nh := nh + 1
+        mmi_ := 100.0 * (nl + nh) / (len_ - 1) 
+    mmi_
+
+// A second order lowpass filter by Johann C. Lotter
+lowpass(src, len) => 
+    a = 2.0 / (1 + len)
+    a2 = a * a
+    lp = 0.0
+    lp := (a - 0.25 * a2) * src + 0.5 * a2 * src[1] - (a - 0.75 * a2) * src[2] + 2 * (1.0 - a) * nz(lp[1]) - (1.0 - a) * (1.0 - a) * nz(lp[2])
+    lp
+
+// John Ehlers' "Super Smoother", a 2-pole Butterworth filter combined with a 2-bar SMA that suppresses the Nyquist frequency    
+smooth(src, len) =>
+    f = (1.414 * 3.14159) / len
+    a = exp(-f)
+    c2 = 2 * a * cos(f)
+    c3 = (-a) * a
+    c1 = 1 - c2 - c3
+    s = 0.0
+    s := c1 * (src + nz(src[1])) * 0.5 + c2 * nz(s[1]) + c3 * nz(s[2])
+    s
+
+// Ehlers' Zero-Lag Moving Average, an EMA with a correction term for removing lag
+zma(src, len) =>
+    zma = 0.0
+    a = 2.0 / (1 + len)
+    //ema_ = ema(src, len)
+    ema_ = 0.0
+    ema_ := a * src + (1 - a) * nz(ema_[1])
+    least_error = 1000000.0
+    gain_limit = 5
+    best_gain = 0
+    for gain = -gain_limit to gain_limit - 0.1 by 0.1
+        zma := a * (ema_ + gain * (src - nz(zma[1]))) + (1 - a) * nz(zma[1])
+        error = src - zma
+        if (abs(error) < least_error)
+            least_error := abs(error)
+            best_gain := gain
+    zma := a * (ema_ + best_gain * (src - nz(zma[1]))) + (1 - a) * nz(zma[1])
+    zma
+
+// A 4-element Laguerre filter
+laguerre(src, alpha) =>
+    L0 = 0.0
+    L0 := alpha * src + (1 - alpha) * nz(L0[1])
+    L2 = 0.0
+    L2 := -(1 - alpha) * L0 + nz(L0[1]) + (1 - alpha) * nz(L2[1])
+    L4 = 0.0
+    L4 := -(1 - alpha) * L2 + nz(L2[1]) + (1 - alpha) * nz(L4[1])
+    L6 = 0.0
+    L6 := -(1 - alpha) * L4 + nz(L4[1]) + (1 - alpha) * nz(L6[1])
+    (L0 + 2 * L2 + 2 * L4 + L6) / 6
+
+// Highpass filter by John F. Ehlers
+highpass2(src, len) =>
+    a = (0.707 * 2 * 3.14159) / len
+    alpha1 = 1.0  + (sin(a) - 1.0) / cos(a)
+    b = 1.0 - alpha1 / 2.0
+    c = 1.0 - alpha1
+    hp = 0.0
+    hp := b * b * (src - 2 * nz(src[1]) + nz(src[2])) + 2 * c * nz(hp[1]) - c * c * nz(hp[2])
+    hp
+
+// Another low-lag indicator by John Ehlers
+decycle(src, len) =>
+    src - highpass2(src, len)
+    
+filter(type, src, len) =>
+    type == "EMA"           ? ema(src, len) : 
+      type == "LowPass"     ? lowpass(src, len) : 
+      type == "Hull MA"     ? wma(2 * wma(src, ceil(len / 2)) - wma(src, len), ceil(sqrt(len))) : 
+      type == "Zero-Lag MA" ? zma(src, len) : 
+      type == "ALMA"        ? alma(src, len, 0.85, 6) : 
+      type == "Laguerre"    ? laguerre(src, 4.0 / (1 + len)) : 
+      type == "Smooth"      ? smooth(src, len) : 
+      type == "Decycle"     ? decycle(src, len) : 
+                              sma(src, len)
+
+trend = filter(trend_filter_type, price_src, trend_filter_len)
+mmi_raw = mmi(price_src, mmi_len)
+mmi_smooth = lowpass(mmi_raw, mmi_len) // SMA is slow, better use LowPass for smoothing MMI. See http://www.financial-hacker.com/boosting-systems-by-trade-filtering/#comment-12654
+
+// when the smoothed MMI is falling, it means that the market has entered trending mode within the last 200 to 500 bars
+plot(trend, linewidth=2)
+plotshape(is_valley(trend) and is_falling(mmi_smooth) ? close : na, style=shape.triangleup, location=location.belowbar, color=green, size=size.small)
+plotshape(is_peak(trend) and is_falling(mmi_smooth) ? close : na, style=shape.triangledown, location=location.abovebar, color=maroon, size=size.small)
